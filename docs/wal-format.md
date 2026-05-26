@@ -18,7 +18,7 @@ title: "WAL Entry (repeats for each entry)"
 packet-beta
 0-31: "length (u32)"
 32-63: "crc32 (u32)"
-64-95: "payload (length bytes)
+64-95: "payload (length bytes)"
 ```
 
 ```mermaid
