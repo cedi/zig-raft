@@ -42,3 +42,12 @@ packet-beta
 64-95: "val_len (u32)"
 96-127: "value (val_len bytes)"
 ```
+
+```mermaid
+---
+title: "Command Body: Delete(key)"
+---
+packet-beta
+0-31: "key_len (u32)"
+32-63: "key (key_len bytes)"
+```
