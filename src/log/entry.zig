@@ -2,7 +2,7 @@ const std = @import("std");
 const payload = @import("payload.zig");
 const command = @import("command.zig");
 
-/// A complete WAL entry with the complete length of the payload and a CRC32 checksum to verify integrity
+/// WAL entry: length-prefixed payload with CRC32 integrity check.
 pub const Entry = struct {
     payload: payload.Payload,
 
@@ -20,12 +20,7 @@ pub const Entry = struct {
         return init(self.payload.dupe(allocator));
     }
 
-    /// Serialize a WAL Entry t oit's wire format complete with calculating the CRC32 hash
-    /// for integrity
-    // Wire layout:
-    //   [0..4]            length (u32, little-endian)
-    //   [4..8]            crc32  (u32, little-endian, CRC of the payload region)
-    //   [8..8+length]     payload bytes
+    /// Serialize to wire format with CRC32 calculation.
     pub fn serialize(self: Entry, allocator: std.mem.Allocator, writer: *std.Io.Writer) !void {
         var aw: std.Io.Writer.Allocating = .init(allocator);
         defer aw.deinit();
@@ -40,13 +35,12 @@ pub const Entry = struct {
         try writer.writeAll(bytes);
     }
 
-    /// Deserialize a WAL entry from it's binary format and returns `error.CrcMismatch` if the entry is corrupt
+    /// Deserialize from wire format. Returns `error.CrcMismatch` on corruption.
     pub fn deserialize(allocator: std.mem.Allocator, reader: *std.Io.Reader) !Entry {
         const length = try reader.takeInt(u32, .little);
         const crc = try reader.takeInt(u32, .little);
 
-        // Buffer the entire payload region before doing anything with it.
-        // The CRC must pass before we trust any of these bytes.
+        // CRC must pass before we trust the payload bytes.
         const buffer = try allocator.alloc(u8, length);
         defer allocator.free(buffer);
         try reader.readSliceAll(buffer);

@@ -1,8 +1,8 @@
 const std = @import("std");
 const log = @import("log");
 
-/// In-memory key-value state machine. Commands enter via `apply`; reads and
-/// writes share the same path so linearization is determined by apply order.
+/// In-memory key-value state machine. All commands go through `apply`;
+/// linearization is determined by apply order.
 pub const Store = struct {
     allocator: std.mem.Allocator,
     map: std.StringHashMap([]u8),
@@ -23,8 +23,8 @@ pub const Store = struct {
         self.map.deinit();
     }
 
-    /// Apply a command. Writes return null; reads return a borrowed slice
-    /// pointing into the store's storage (valid until the next mutation).
+    /// Writes return null. Reads return a slice borrowed from the store,
+    /// valid until the next mutation.
     pub fn apply(self: *Store, cmd: log.Command) !?[]const u8 {
         switch (cmd) {
             .set => |s| {
@@ -39,9 +39,7 @@ pub const Store = struct {
         }
     }
 
-    /// Convenience wrapper: build a Get command and apply it. In a real Raft
-    /// node this method's body would also replicate the command through the
-    /// log before applying. Here it short-circuits straight to apply.
+    /// Build a Get command and apply it directly (bypasses the log).
     pub fn get(self: *Store, key: []const u8) !?[]const u8 {
         var cmd = log.Command{ .get = try log.GetCommand.init(self.allocator, key) };
         defer cmd.deinit(self.allocator);
@@ -162,7 +160,7 @@ test "replay log to derive state" {
     var store = Store.init(allocator);
     defer store.deinit();
 
-    // The replay loop — log and state meet here.
+    // replay loop
     for (0..raft_log.len()) |i| {
         _ = try store.apply(raft_log.at(i).?.cmd);
     }
@@ -178,7 +176,7 @@ test "get goes through apply (linearization point)" {
     var raft_log = log.Log.init(allocator);
     defer raft_log.deinit();
 
-    // Mix of writes and reads, all going through the log in order.
+    // interleaved writes and reads
     try raft_log.append(0, .{ .set = try log.SetCommand.init(allocator, "counter", "1") });
     try raft_log.append(0, .{ .get = try log.GetCommand.init(allocator, "counter") });
     try raft_log.append(0, .{ .set = try log.SetCommand.init(allocator, "counter", "2") });
@@ -187,10 +185,7 @@ test "get goes through apply (linearization point)" {
     var store = Store.init(allocator);
     defer store.deinit();
 
-    // First get observes "1", second get observes "2". apply order is the
-    // linearization order, so the read at index 2 sees the write at index 1
-    // but not the one at index 3. Read results are borrowed and only valid
-    // until the next mutation, so we check each one inline.
+    // get at index 1 sees write at index 0; get at index 3 sees write at index 2
     const expected_reads = [_]?[]const u8{ null, "1", null, "2" };
     for (0..raft_log.len()) |i| {
         const result = try store.apply(raft_log.at(i).?.cmd);

@@ -41,12 +41,30 @@ pub fn build(b: *std.Build) void {
             .{ .name = "log", .module = log_mod },
         },
     });
+    const transport_mod = b.addModule("transport", .{
+        .root_source_file = b.path("src/transport/root.zig"),
+        .target = target,
+        .imports = &.{
+            .{ .name = "log", .module = log_mod },
+        },
+    });
     const node_mod = b.addModule("node", .{
         .root_source_file = b.path("src/node/node.zig"),
         .target = target,
         .imports = &.{
             .{ .name = "log", .module = log_mod },
             .{ .name = "state", .module = state_mod },
+            .{ .name = "transport", .module = transport_mod },
+        },
+    });
+    const testing_mod = b.addModule("testing", .{
+        .root_source_file = b.path("src/testing/root.zig"),
+        .target = target,
+        .imports = &.{
+            .{ .name = "log", .module = log_mod },
+            .{ .name = "state", .module = state_mod },
+            .{ .name = "transport", .module = transport_mod },
+            .{ .name = "node", .module = node_mod },
         },
     });
 
@@ -65,6 +83,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "log", .module = log_mod },
             .{ .name = "state", .module = state_mod },
             .{ .name = "node", .module = node_mod },
+            .{ .name = "transport", .module = transport_mod },
         },
     });
 
@@ -177,6 +196,14 @@ pub fn build(b: *std.Build) void {
         .root_module = node_mod,
     });
     const run_node_tests = b.addRunArtifact(node_tests);
+    const transport_tests = b.addTest(.{
+        .root_module = transport_mod,
+    });
+    const run_transport_tests = b.addRunArtifact(transport_tests);
+    const testing_tests = b.addTest(.{
+        .root_module = testing_mod,
+    });
+    const run_testing_tests = b.addRunArtifact(testing_tests);
 
     // A top level step for running all tests. dependOn can be called multiple
     // times and since the run steps do not depend on one another, this will
@@ -187,6 +214,8 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_log_tests.step);
     test_step.dependOn(&run_state_tests.step);
     test_step.dependOn(&run_node_tests.step);
+    test_step.dependOn(&run_transport_tests.step);
+    test_step.dependOn(&run_testing_tests.step);
 
     // Just like flags, top level steps are also listed in the `--help` menu.
     //

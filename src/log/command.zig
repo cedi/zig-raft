@@ -84,11 +84,7 @@ pub const DeleteCommand = struct {
     }
 };
 
-/// Return the value of a key
-/// reads go through the log too. Get("foo") becomes a command, gets a log index, gets applied,
-/// returns the value the state machine saw at that index.
-/// Slow but trivially linearizable.
-/// Good for learning because it makes the model uniform: everything is a log entry.
+/// Read a key. Goes through the log like writes, making it trivially linearizable.
 pub const GetCommand = struct {
     key: []u8,
 
@@ -124,17 +120,14 @@ pub const GetCommand = struct {
     }
 };
 
-/// The Tag as enum(u8) that we need to deserialize back from wire-format
-/// into our DSL types
+/// Wire-format tag for Command deserialization.
 pub const CommandTag = enum(u8) {
     set = 0,
     delete = 1,
     get = 2,
 };
 
-/// Command is a singular Raft command that will be appended to our WAL log
-/// It is a union of the Enum CommandTag that defines the available operations
-/// we support in our database
+/// A single Raft command (set, delete, or get).
 pub const Command = union(CommandTag) {
     set: SetCommand,
     delete: DeleteCommand,
@@ -156,7 +149,7 @@ pub const Command = union(CommandTag) {
         }
     }
 
-    /// Serialize a command to it's wire-format to binary
+    /// Serialize to wire format.
     pub fn serialize(self: Command, writer: *std.Io.Writer) std.Io.Writer.Error!void {
         try writer.writeInt(u8, @intFromEnum(self), .little);
         switch (self) {
@@ -166,7 +159,7 @@ pub const Command = union(CommandTag) {
         }
     }
 
-    /// Deserialize a command from it's wire-format back to the DSL types
+    /// Deserialize from wire format.
     pub fn deserialize(allocator: std.mem.Allocator, reader: *std.Io.Reader) !Command {
         const tag_byte = try reader.takeInt(u8, .little);
         const tag = std.enums.fromInt(CommandTag, tag_byte) orelse return error.InvalidCommandTag;

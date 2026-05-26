@@ -1,8 +1,7 @@
 const std = @import("std");
 const command = @import("command.zig");
 
-/// A payload is a Command with the required metadata, such as it's index and the term
-/// of the leader election cycle to ensure commands are applied in the right order
+/// A Command with its log index and election term.
 pub const Payload = struct {
     index: u64,
     term: u64,

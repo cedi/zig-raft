@@ -1,7 +1,4 @@
-//! The log module provides all the primitives required for working with the
-//! Raft command log.
-//! It provides the simple Command type, but also the log storage and the
-//! structs to serialize the WAL (to disk) in it's own, native binary format.
+//! Raft command log: command types, log storage, and WAL serialization.
 
 pub const Command = @import("command.zig").Command;
 pub const SetCommand = @import("command.zig").SetCommand;

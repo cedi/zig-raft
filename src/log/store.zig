@@ -2,8 +2,7 @@ const std = @import("std");
 const payload = @import("payload.zig");
 const command = @import("command.zig");
 
-/// Log is the complete in-memory log storage for our Raft log.
-/// It takes full ownership of it's data.
+/// In-memory Raft log. Takes ownership of appended entries.
 pub const Log = struct {
     allocator: std.mem.Allocator,
     entries: std.ArrayList(payload.Payload),
@@ -35,6 +34,12 @@ pub const Log = struct {
     pub fn at(self: *const Log, index: usize) ?*const payload.Payload {
         if (index >= self.entries.items.len) return null;
         return &self.entries.items[index];
+    }
+
+    /// Remove entries from `from` onward, freeing their owned memory.
+    pub fn truncateFrom(self: *Log, from: usize) void {
+        for (self.entries.items[from..]) |*p| p.deinit(self.allocator);
+        self.entries.shrinkRetainingCapacity(from);
     }
 };
 
