@@ -14,7 +14,7 @@ pub const RaftNode = struct {
 
     // persistent state on all servers
     currentTerm: u64,
-    votedFor: u64,
+    votedFor: ?u64,
 
     log: log.Log,
     state: state.Store,
@@ -31,7 +31,7 @@ pub const RaftNode = struct {
         return .{
             .allocator = allocator,
             .currentTerm = 0,
-            .votedFor = undefined,
+            .votedFor = null,
             .log = .init(allocator),
             .state = .init(allocator),
             .commitIndex = 0,
@@ -75,14 +75,12 @@ pub const RaftNode = struct {
         }
 
         // 2. Reply false if log doesn’t contain an entry at prevLogIndex
-        // whose term matches prevLogTerm (§5.3)
-        const prevLog = self.log.at(prevLogIndex);
-        if (prevLogIndex > 0 and prevLog == null) {
-            return error.PrevIndexNotExist;
-        }
-
-        if (prevLogIndex > 0 and prevLog.?.term != prevLogTerm) {
-            return error.PrevIndexTermMismatch;
+        //    whose term matches prevLogTerm (§5.3)
+        if (prevLogIndex > 0) {
+            const prevLog = self.log.at(prevLogIndex) orelse return error.PrevIndexNotExist;
+            if (prevLog.term != prevLogTerm) {
+                return error.PrevIndexTermMismatch;
+            }
         }
 
         // 3. If an existing entry conflicts with a new one (same index
@@ -102,7 +100,86 @@ pub const RaftNode = struct {
 
         return result;
     }
+
+    // Invoked by candidates to gather votes (§5.2).
+    pub fn requestVote(self: *RaftNode, term: u64, candidateId: u64, prevLogIndex: u64, prevLogTerm: u64) bool {
+        // 1. Reply false if term < currentTerm (§5.1)
+        if (term < self.currentTerm) {
+            return false;
+        }
+
+        // If votedFor is null or candidateId
+        if (self.votedFor != null and self.votedFor.? != candidateId) {
+            return false;
+        }
+
+        // and candidate’s log is at least as up-to-date as receiver’s log, grant vote (§5.2, §5.4)
+        const lastLogTerm: u64 = if (self.log.len() > 0) self.log.at(self.log.len() - 1).?.term else 0;
+        const lastLogIndex: u64 = if (self.log.len() > 0) self.log.len() - 1 else 0;
+
+        // §5.4.1: compare last entries. later term wins: same term, longer log wins
+        if (prevLogTerm < lastLogTerm) {
+            return false;
+        }
+
+        if (prevLogTerm == lastLogTerm and prevLogIndex < lastLogIndex) {
+            return false;
+        }
+
+        self.votedFor = candidateId;
+        return true;
+    }
 };
+
+test "requestVote: valid" {
+    const allocator = std.testing.allocator;
+
+    var raft_log = log.Log.init(allocator);
+    defer raft_log.deinit();
+
+    try raft_log.append(0, .{ .set = try log.SetCommand.init(allocator, "alice", "engineer") });
+    try raft_log.append(0, .{ .set = try log.SetCommand.init(allocator, "bob", "manager") });
+    try raft_log.append(1, .{ .set = try log.SetCommand.init(allocator, "alice", "principal") });
+    try raft_log.append(1, .{ .delete = try log.DeleteCommand.init(allocator, "bob") });
+
+    var node = RaftNode.init(allocator);
+    defer node.deinit();
+
+    _ = try node.withWal(raft_log);
+
+    try std.testing.expect(node.requestVote(2, 2, 3, 1));
+}
+
+test "requestVote: invalid" {
+    const allocator = std.testing.allocator;
+
+    var raft_log = log.Log.init(allocator);
+    defer raft_log.deinit();
+
+    try raft_log.append(0, .{ .set = try log.SetCommand.init(allocator, "alice", "engineer") });
+    try raft_log.append(0, .{ .set = try log.SetCommand.init(allocator, "bob", "manager") });
+    try raft_log.append(1, .{ .set = try log.SetCommand.init(allocator, "alice", "principal") });
+    try raft_log.append(1, .{ .delete = try log.DeleteCommand.init(allocator, "bob") });
+
+    var node = RaftNode.init(allocator);
+    defer node.deinit();
+
+    _ = try node.withWal(raft_log);
+
+    try std.testing.expectEqual(1, node.currentTerm);
+
+    // invalid term
+    try std.testing.expectEqual(false, node.requestVote(0, 2, 3, 1));
+
+    // invalid prevLogIndex
+    try std.testing.expectEqual(false, node.requestVote(2, 2, 2, 1));
+    // invalid prevLogTer
+    try std.testing.expectEqual(false, node.requestVote(2, 2, 3, 0));
+
+    // test two nodes requesting votes, but already voted
+    try std.testing.expectEqual(true, node.requestVote(2, 2, 3, 1));
+    try std.testing.expectEqual(false, node.requestVote(2, 3, 3, 1));
+}
 
 test "replay WAL" {
     const allocator = std.testing.allocator;
