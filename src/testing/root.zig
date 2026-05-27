@@ -210,3 +210,107 @@ test "tick-driven: leader heartbeats prevent follower elections" {
     try std.testing.expectEqual(NodeState.leader, node_a.nodeState);
     try std.testing.expectEqual(NodeState.follower, node_b.nodeState);
 }
+
+test "tick-driven: submitted commands replicate to all nodes" {
+    const allocator = std.testing.allocator;
+
+    var mem = MemTransport.init(allocator);
+    defer mem.deinit();
+
+    const config = node.Config{
+        .election_timeout_min = 10,
+        .election_timeout_max = 15,
+        .heartbeat_interval = 3,
+    };
+
+    var node_a = RaftNode.init(allocator, mem.transport(), config);
+    defer node_a.deinit();
+    try node_a.register();
+
+    var node_b = RaftNode.init(allocator, mem.transport(), config);
+    defer node_b.deinit();
+    try node_b.register();
+
+    var node_c = RaftNode.init(allocator, mem.transport(), config);
+    defer node_c.deinit();
+    try node_c.register();
+
+    try node_a.addPeer(node_b.nodeId);
+    try node_a.addPeer(node_c.nodeId);
+    try node_b.addPeer(node_a.nodeId);
+    try node_b.addPeer(node_c.nodeId);
+    try node_c.addPeer(node_a.nodeId);
+    try node_c.addPeer(node_b.nodeId);
+
+    // elect node_a as leader
+    try std.testing.expectEqual(node.ElectionResult.won, try node_a.startElection());
+
+    // submit commands to the leader
+    try node_a.submitCommand(.{ .set = try log.SetCommand.init(allocator, "x", "1") });
+    try node_a.submitCommand(.{ .set = try log.SetCommand.init(allocator, "y", "2") });
+    try node_a.submitCommand(.{ .set = try log.SetCommand.init(allocator, "x", "3") });
+
+    // tick once to drain inbox and replicate
+    try node_a.tick();
+
+    // all three nodes should have 3 log entries
+    try std.testing.expectEqual(@as(usize, 3), node_a.log.len());
+    try std.testing.expectEqual(@as(usize, 3), node_b.log.len());
+    try std.testing.expectEqual(@as(usize, 3), node_c.log.len());
+
+    // all three state machines converge
+    try std.testing.expectEqualSlices(u8, "3", (try node_a.state.get("x")).?);
+    try std.testing.expectEqualSlices(u8, "3", (try node_b.state.get("x")).?);
+    try std.testing.expectEqualSlices(u8, "3", (try node_c.state.get("x")).?);
+
+    try std.testing.expectEqualSlices(u8, "2", (try node_a.state.get("y")).?);
+    try std.testing.expectEqualSlices(u8, "2", (try node_b.state.get("y")).?);
+    try std.testing.expectEqualSlices(u8, "2", (try node_c.state.get("y")).?);
+}
+
+test "tick-driven: submitted commands to follower fails" {
+    const allocator = std.testing.allocator;
+
+    var mem = MemTransport.init(allocator);
+    defer mem.deinit();
+
+    const config = node.Config{
+        .election_timeout_min = 10,
+        .election_timeout_max = 15,
+        .heartbeat_interval = 3,
+    };
+
+    var node_a = RaftNode.init(allocator, mem.transport(), config);
+    defer node_a.deinit();
+    try node_a.register();
+
+    var node_b = RaftNode.init(allocator, mem.transport(), config);
+    defer node_b.deinit();
+    try node_b.register();
+
+    try node_a.addPeer(node_b.nodeId);
+    try node_b.addPeer(node_a.nodeId);
+
+    // elect node_a as leader
+    try std.testing.expectEqual(node.ElectionResult.won, try node_a.startElection());
+
+    // submit commands to the leader
+    try node_a.submitCommand(.{ .set = try log.SetCommand.init(allocator, "x", "1") });
+
+    // tick once to drain inbox and replicate
+    try node_a.tick();
+
+    // all three nodes should have 3 log entries
+    try std.testing.expectEqual(@as(usize, 1), node_a.log.len());
+    try std.testing.expectEqual(@as(usize, 1), node_b.log.len());
+
+    // all three state machines converge
+    try std.testing.expectEqualSlices(u8, "1", (try node_a.state.get("x")).?);
+    try std.testing.expectEqualSlices(u8, "1", (try node_b.state.get("x")).?);
+
+    // submitting to a follower returns error.NotLeader
+    var cmd = log.Command{ .set = try log.SetCommand.init(allocator, "y", "2") };
+    defer cmd.deinit(allocator);
+
+    try std.testing.expectError(error.NotLeader, node_b.submitCommand(cmd));
+}

@@ -43,6 +43,9 @@ pub const RaftNode = struct {
     /// Maps peerId to matchIndex.
     peerIndex: std.AutoHashMap(u64, u64),
 
+    // client command inbox, drained by leader on each tick
+    inbox: std.ArrayList(log.Command),
+
     // event loop state
     prng: std.Random.DefaultPrng,
     config: Config,
@@ -74,6 +77,7 @@ pub const RaftNode = struct {
             .commitIndex = 0,
             .nodeState = NodeState.follower,
             .peerIndex = .init(allocator),
+            .inbox = .empty,
             .prng = prng,
             .config = config,
             .tickCount = 0,
@@ -99,6 +103,8 @@ pub const RaftNode = struct {
 
     pub fn deinit(self: *RaftNode) void {
         self.transport.unregister(self.nodeId);
+        for (self.inbox.items) |*cmd| cmd.deinit(self.allocator);
+        self.inbox.deinit(self.allocator);
         self.peerIndex.deinit();
         self.state.deinit();
         self.log.deinit();
@@ -106,6 +112,14 @@ pub const RaftNode = struct {
 
     pub fn addPeer(self: *RaftNode, peerId: u64) !void {
         try self.peerIndex.put(peerId, 0);
+    }
+
+    pub fn submitCommand(self: *RaftNode, cmd: log.Command) !void {
+        if (self.nodeState != .leader) {
+            return error.NotLeader;
+        }
+
+        try self.inbox.append(self.allocator, cmd);
     }
 
     pub fn stop(self: *RaftNode) void {
@@ -147,6 +161,12 @@ pub const RaftNode = struct {
                 }
             },
             .leader => {
+                // drain pending client commands
+                while (self.inbox.items.len > 0) {
+                    const cmd = self.inbox.orderedRemove(0);
+                    _ = self.replicateEntry(cmd) catch continue;
+                }
+
                 if (self.tickCount >= self.heartbeatDeadline) {
                     self.sendHeartbeats();
                     self.resetHeartbeatDeadline();
