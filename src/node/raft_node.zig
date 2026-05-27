@@ -16,6 +16,12 @@ pub const ElectionResult = enum {
     timeout,
 };
 
+pub const Config = struct {
+    election_timeout_min: u64 = 150,
+    election_timeout_max: u64 = 300,
+    heartbeat_interval: u64 = 50,
+};
+
 /// Raft node implementing the core protocol from the Raft paper.
 pub const RaftNode = struct {
     allocator: std.mem.Allocator,
@@ -37,14 +43,25 @@ pub const RaftNode = struct {
     /// Maps peerId to matchIndex.
     peerIndex: std.AutoHashMap(u64, u64),
 
+    // event loop state
+    prng: std.Random.DefaultPrng,
+    config: Config,
+    tickCount: u64,
+    electionDeadline: u64,
+    heartbeatDeadline: u64,
+    stopped: bool,
+
     // Per-process counter to ensure unique PRNG seeds across nodes.
     var next_node_id: u64 = 1;
 
-    pub fn init(allocator: std.mem.Allocator, t: *transport.Transport) RaftNode {
+    pub fn init(allocator: std.mem.Allocator, t: *transport.Transport, config: Config) RaftNode {
         var prng = std.Random.DefaultPrng.init(@intFromPtr(t) +% next_node_id);
 
         // wrapping add: won't panic on overflow
         next_node_id +%= 1;
+
+        const election_deadline = config.election_timeout_min +
+            prng.random().uintLessThan(u64, config.election_timeout_max - config.election_timeout_min);
 
         return .{
             .allocator = allocator,
@@ -57,6 +74,12 @@ pub const RaftNode = struct {
             .commitIndex = 0,
             .nodeState = NodeState.follower,
             .peerIndex = .init(allocator),
+            .prng = prng,
+            .config = config,
+            .tickCount = 0,
+            .electionDeadline = election_deadline,
+            .heartbeatDeadline = 0,
+            .stopped = false,
         };
     }
 
@@ -83,6 +106,65 @@ pub const RaftNode = struct {
 
     pub fn addPeer(self: *RaftNode, peerId: u64) !void {
         try self.peerIndex.put(peerId, 0);
+    }
+
+    pub fn stop(self: *RaftNode) void {
+        self.stopped = true;
+    }
+
+    fn resetElectionDeadline(self: *RaftNode) void {
+        const jitter = self.prng.random().uintLessThan(u64, self.config.election_timeout_max - self.config.election_timeout_min);
+        self.electionDeadline = self.tickCount + self.config.election_timeout_min + jitter;
+    }
+
+    fn resetHeartbeatDeadline(self: *RaftNode) void {
+        self.heartbeatDeadline = self.tickCount + self.config.heartbeat_interval;
+    }
+
+    fn sendHeartbeats(self: *RaftNode) void {
+        var it = self.peerIndex.iterator();
+        while (it.next()) |entry| {
+            _ = self.transport.sendAppendEntries(entry.key_ptr.*, .{
+                .term = self.currentTerm,
+                .leaderId = self.nodeId,
+                .prevLogIndex = 0,
+                .prevLogTerm = 0,
+                .lastCommitIdx = self.commitIndex,
+                .entry = null,
+            }) catch continue;
+        }
+    }
+
+    /// Advance the logical clock by one tick and act on timeouts.
+    pub fn tick(self: *RaftNode) !void {
+        self.tickCount += 1;
+
+        switch (self.nodeState) {
+            .follower, .candidate => {
+                if (self.tickCount >= self.electionDeadline) {
+                    _ = try self.startElection();
+                    self.resetElectionDeadline();
+                }
+            },
+            .leader => {
+                if (self.tickCount >= self.heartbeatDeadline) {
+                    self.sendHeartbeats();
+                    self.resetHeartbeatDeadline();
+                }
+            },
+        }
+    }
+
+    /// Blocking event loop. Each iteration advances one tick, then sleeps
+    /// for `tick_ms` milliseconds. Call stop() from another thread to exit.
+    pub fn run(self: *RaftNode, tick_ms: u64) !void {
+        const ns: u64 = tick_ms * 1_000_000;
+        const req = std.c.timespec{ .sec = @intCast(ns / 1_000_000_000), .nsec = @intCast(ns % 1_000_000_000) };
+
+        while (!self.stopped) {
+            try self.tick();
+            _ = std.c.nanosleep(&req, null);
+        }
     }
 
     pub fn asPeer(self: *RaftNode) transport.Peer {
@@ -123,12 +205,7 @@ pub const RaftNode = struct {
         return self;
     }
 
-    /// §5.2: election timeout for case (c) "no winner". Currently unused
-    /// because the synchronous transport completes RPCs instantly.
-    /// Will be wired into the run() event loop.
-    pub fn startElection(self: *RaftNode, timeout_ms: u64) !ElectionResult {
-        _ = timeout_ms; // TODO: wire into run() event loop
-
+    pub fn startElection(self: *RaftNode) !ElectionResult {
         self.currentTerm += 1;
         self.votedFor = self.nodeId;
         self.nodeState = .candidate;
@@ -159,6 +236,7 @@ pub const RaftNode = struct {
 
         if (votes >= self.majority()) {
             self.nodeState = .leader;
+            self.resetHeartbeatDeadline();
             return .won;
         }
 
@@ -168,6 +246,14 @@ pub const RaftNode = struct {
 
     fn handleRequestVote(ctx: *anyopaque, req: transport.RequestVoteRequest) transport.RequestVoteResponse {
         const self: *RaftNode = @ptrCast(@alignCast(ctx));
+
+        // §5.1: adopt higher term
+        if (req.term > self.currentTerm) {
+            self.currentTerm = req.term;
+            self.nodeState = .follower;
+            self.votedFor = null;
+        }
+
         const granted = self.requestVote(req.term, req.candidateId, req.lastLogIdx, req.lastLogTerm);
         return .{ .term = self.currentTerm, .voteGranted = granted };
     }
@@ -236,6 +322,15 @@ pub const RaftNode = struct {
 
     fn handleAppendEntries(ctx: *anyopaque, req: transport.AppendEntriesRequest) transport.AppendEntriesResponse {
         const self: *RaftNode = @ptrCast(@alignCast(ctx));
+        self.resetElectionDeadline();
+
+        // §5.1: adopt leader's term
+        if (req.term > self.currentTerm) {
+            self.currentTerm = req.term;
+            self.nodeState = .follower;
+            self.votedFor = null;
+        }
+
         if (req.entry) |entry| {
             _ = self.appendEntry(req.prevLogIndex, req.prevLogTerm, log.Entry.init(entry)) catch {
                 return .{ .term = self.currentTerm, .success = false };
@@ -259,7 +354,7 @@ pub const RaftNode = struct {
         }
 
         // 2. Reply false if log doesn’t contain an entry at prevLogIndex
-        //    whose term matches prevLogTerm (§5.3)
+        // whose term matches prevLogTerm (§5.3)
         if (prevLogIndex > 0) {
             const prevLog = self.log.at(prevLogIndex) orelse return error.PrevIndexNotExist;
             if (prevLog.term != prevLogTerm) {
@@ -304,7 +399,7 @@ test "requestVote: valid" {
     try raft_log.append(1, .{ .delete = try log.DeleteCommand.init(allocator, "bob") });
 
     var noop = test_transport.NoopTransport.init();
-    var node = RaftNode.init(allocator, noop.interface());
+    var node = RaftNode.init(allocator, noop.interface(), .{});
     defer node.deinit();
 
     _ = try node.withWal(raft_log);
@@ -324,7 +419,7 @@ test "requestVote: invalid" {
     try raft_log.append(1, .{ .delete = try log.DeleteCommand.init(allocator, "bob") });
 
     var noop = test_transport.NoopTransport.init();
-    var node = RaftNode.init(allocator, noop.interface());
+    var node = RaftNode.init(allocator, noop.interface(), .{});
     defer node.deinit();
 
     _ = try node.withWal(raft_log);
@@ -356,7 +451,7 @@ test "replay WAL" {
     try raft_log.append(1, .{ .delete = try log.DeleteCommand.init(allocator, "bob") });
 
     var noop = test_transport.NoopTransport.init();
-    var node = RaftNode.init(allocator, noop.interface());
+    var node = RaftNode.init(allocator, noop.interface(), .{});
     defer node.deinit();
 
     _ = try node.withWal(raft_log);
@@ -373,7 +468,7 @@ test "appendEntry" {
     const allocator = std.testing.allocator;
 
     var noop = test_transport.NoopTransport.init();
-    var node = RaftNode.init(allocator, noop.interface());
+    var node = RaftNode.init(allocator, noop.interface(), .{});
     defer node.deinit();
 
     _ = try node.appendEntry(0, 0, .{ .payload = .{ .index = 0, .term = 1, .cmd = .{ .set = try log.SetCommand.init(allocator, "foo", "bar") } } });
@@ -400,7 +495,7 @@ test "replay WAL and appendEntry RPC" {
     try raft_log.append(1, .{ .delete = try log.DeleteCommand.init(allocator, "bob") });
 
     var noop = test_transport.NoopTransport.init();
-    var node = RaftNode.init(allocator, noop.interface());
+    var node = RaftNode.init(allocator, noop.interface(), .{});
     defer node.deinit();
 
     _ = try node.withWal(raft_log);
@@ -428,7 +523,7 @@ test "appendEntry: conflicting entry truncates log" {
     const allocator = std.testing.allocator;
 
     var noop = test_transport.NoopTransport.init();
-    var node = RaftNode.init(allocator, noop.interface());
+    var node = RaftNode.init(allocator, noop.interface(), .{});
     defer node.deinit();
 
     // entries from old leader in term 1
@@ -450,7 +545,7 @@ test "appendEntry: duplicate entry is idempotent" {
     const allocator = std.testing.allocator;
 
     var noop = test_transport.NoopTransport.init();
-    var node = RaftNode.init(allocator, noop.interface());
+    var node = RaftNode.init(allocator, noop.interface(), .{});
     defer node.deinit();
 
     _ = try node.appendEntry(0, 0, .{ .payload = .{ .index = 0, .term = 1, .cmd = .{ .set = try log.SetCommand.init(allocator, "a", "1") } } });
